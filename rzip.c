@@ -101,103 +101,12 @@ static struct level {
 	{ 64, 1, 128 },
 };
 
-static void remap_low_sb(rzip_control *control, struct sliding_buffer *sb)
-{
-	i64 new_offset;
-
-	new_offset = sb->offset_search;
-	round_to_page(&new_offset);
-	print_maxverbose("Sliding main buffer to offset %lld\n", new_offset);
-	if (unlikely(munmap(sb->buf_low, sb->size_low)))
-		failure("Failed to munmap in remap_low_sb\n");
-	if (new_offset + sb->size_low > sb->orig_size)
-		sb->size_low = sb->orig_size - new_offset;
-	sb->offset_low = new_offset;
-	sb->buf_low = (uchar *)mmap(sb->buf_low, sb->size_low, PROT_READ, MAP_SHARED, sb->fd, sb->orig_offset + sb->offset_low);
-	if (unlikely(sb->buf_low == MAP_FAILED))
-		failure("Failed to re mmap in remap_low_sb\n");
-}
-
-static inline void remap_high_sb(rzip_control *control, struct sliding_buffer *sb, i64 p)
-{
-	if (unlikely(munmap(sb->buf_high, sb->size_high)))
-		failure("Failed to munmap in remap_high_sb\n");
-	sb->size_high = sb->high_length; /* In case we shrunk it when we hit the end of the file */
-	sb->offset_high = p;
-	/* Make sure offset is rounded to page size of total offset */
-	sb->offset_high -= (sb->offset_high + sb->orig_offset) % control->page_size;
-	if (unlikely(sb->offset_high + sb->size_high > sb->orig_size))
-		sb->size_high = sb->orig_size - sb->offset_high;
-	sb->buf_high = (uchar *)mmap(sb->buf_high, sb->size_high, PROT_READ, MAP_SHARED, sb->fd, sb->orig_offset + sb->offset_high);
-	if (unlikely(sb->buf_high == MAP_FAILED))
-		failure("Failed to re mmap in remap_high_sb\n");
-}
-
-/* We use a "sliding mmap" to effectively read more than we can fit into the
- * compression window. This is done by using a maximally sized lower mmap at
- * the beginning of the block which slides up once the hash search moves beyond
- * it, and a 64k mmap block that slides up and down as is required for any
- * offsets outside the range of the lower one. This is much slower than mmap
- * but makes it possible to have unlimited sized compression windows.
- * We use a pointer to the function we actually want to use and only enable
- * the sliding mmap version if we need sliding mmap functionality as this is
- * a hot function during the rzip phase */
-static uchar *sliding_get_sb(rzip_control *control, i64 p)
-{
-	struct sliding_buffer *sb = &control->sb;
-	i64 sbo;
-
-	sbo = sb->offset_low;
-	if (p >= sbo && p < sbo + sb->size_low)
-		return (sb->buf_low + p - sbo);
-	sbo = sb->offset_high;
-	if (p >= sbo && p < (sbo + sb->size_high))
-		return (sb->buf_high + (p - sbo));
-	/* p is not within the low or high buffer range */
-	remap_high_sb(control, &control->sb, p);
-	/* Use sb->offset_high directly since it will have changed */
-	return (sb->buf_high + (p - sb->offset_high));
-}
-
-/* The length of continous range of the sliding buffer,
- * starting from the offset P.
- */
-static inline i64 sliding_get_sb_range(rzip_control *control, i64 p)
-{
-	struct sliding_buffer *sb = &control->sb;
-	i64 sbo, sbs;
-
-	sbo = sb->offset_low;
-	sbs = sb->size_low;
-	if (p >= sbo && p < sbo + sbs)
-		return (sbs - (p - sbo));
-	sbo = sb->offset_high;
-	sbs = sb->size_high;
-	if (likely(p >= sbo && p < (sbo + sbs)))
-		return (sbs - (p - sbo));
-
-	fatal_return(("sliding_get_sb_range: the pointer is out of range\n"), 0);
-}
-
 /* Since the sliding get_sb only allows us to access one byte at a time, we
  * do the same as we did with get_sb with the memcpy since one memcpy is much
  * faster than numerous memcpys 1 byte at a time */
 static void single_mcpy(rzip_control *control, unsigned char *buf, i64 offset, i64 len)
 {
 	memcpy(buf, control->sb.buf_low + offset, len);
-}
-
-static void sliding_mcpy(rzip_control *control, unsigned char *buf, i64 offset, i64 len)
-{
-	i64 n = 0;
-
-	while (n < len) {
-		uchar *srcbuf = sliding_get_sb(control, offset + n);
-		i64 m = MIN(sliding_get_sb_range(control, offset + n), len - n);
-
-		memcpy(buf + n, srcbuf, m);
-		n += m;
-	}
 }
 
 /* All put_u8/u32/vchars go to stream 0 */
@@ -254,7 +163,7 @@ static inline void write_sbstream(rzip_control *control, void *ss, int stream,
 	while (len) {
 		i64 n = MIN(sinfo->bufsize - sinfo->s[stream].buflen, len);
 
-		control->do_mcpy(control, sinfo->s[stream].buf + sinfo->s[stream].buflen, p, n);
+		single_mcpy(control, sinfo->s[stream].buf + sinfo->s[stream].buflen, p, n);
 
 		sinfo->s[stream].buflen += n;
 		p += n;
@@ -412,16 +321,6 @@ static void single_next_tag(rzip_control *control, struct rzip_state *st, i64 p,
 	*t ^= st->hash_index[u];
 }
 
-static void sliding_next_tag(rzip_control *control, struct rzip_state *st, i64 p, tag *t)
-{
-	uchar *u;
-
-	u = sliding_get_sb(control, p - 1);
-	*t ^= st->hash_index[*u];
-	u = sliding_get_sb(control, p + MINIMUM_MATCH - 1);
-	*t ^= st->hash_index[*u];
-}
-
 static tag single_full_tag(rzip_control *control, struct rzip_state *st, i64 p)
 {
 	tag ret = 0;
@@ -431,19 +330,6 @@ static tag single_full_tag(rzip_control *control, struct rzip_state *st, i64 p)
 	for (i = 0; i < MINIMUM_MATCH; i++) {
 		u = control->sb.buf_low[p + i];
 		ret ^= st->hash_index[u];
-	}
-	return ret;
-}
-
-static tag sliding_full_tag(rzip_control *control, struct rzip_state *st, i64 p)
-{
-	tag ret = 0;
-	int i;
-	uchar *u;
-
-	for (i = 0; i < MINIMUM_MATCH; i++) {
-		u = sliding_get_sb(control, p + i);
-		ret ^= st->hash_index[*u];
 	}
 	return ret;
 }
@@ -480,38 +366,6 @@ single_match_len(rzip_control *control, struct rzip_state *st, i64 p0, i64 op,
 	return len;
 }
 
-static i64
-sliding_match_len(rzip_control *control, struct rzip_state *st, i64 p0, i64 op,
-		  i64 end, i64 *rev)
-{
-	i64 p, len;
-
-	if (op >= p0)
-		return 0;
-
-	p = p0;
-	while (p < end && *sliding_get_sb(control, p) == *sliding_get_sb(control, op)) {
-		p++;
-		op++;
-	}
-	len = p - p0;
-	p = p0;
-	op -= len;
-
-	end = MAX(0, st->last_match);
-
-	while (p > end && op > 0 && *sliding_get_sb(control, op - 1) == *sliding_get_sb(control, p - 1)) {
-		op--;
-		p--;
-	}
-
-	len += *rev = p0 - p;
-	if (len < MINIMUM_MATCH)
-		return 0;
-
-	return len;
-}
-
 static inline i64
 find_best_match(rzip_control *control, struct rzip_state *st, tag t, i64 p,
 		i64 end, i64 *offset, i64 *reverse)
@@ -532,7 +386,7 @@ find_best_match(rzip_control *control, struct rzip_state *st, tag t, i64 p,
 		i64 mlen;
 
 		if (t == he->t) {
-			mlen = control->match_len(control, st, p, he->offset, end,
+			mlen = single_match_len(control, st, p, he->offset, end,
 						  &rev);
 			if (mlen) {
 				if (mlen > length) {
@@ -645,14 +499,12 @@ static inline void hash_search(rzip_control *control, struct rzip_state *st,
 	current.ofs = 0;
 
 	if (likely(end > 0))
-		t = control->full_tag(control, st, p);
+		t = single_full_tag(control, st, p);
 
 	while (p < end) {
 		i64 reverse, mlen, offset;
 
 		sb->offset_search = ++p;
-// 		if (unlikely(sb->offset_search > sb->offset_low + sb->size_low))
-// 			remap_low_sb(control, &control->sb);
 
 		if (unlikely(p % 128 == 0 && st->chunk_size)) {
 			i64 chunk_pct;
@@ -672,7 +524,7 @@ static inline void hash_search(rzip_control *control, struct rzip_state *st,
 			}
 		}
 
-		control->next_tag(control, st, p, &t);
+		single_next_tag(control, st, p, &t);
 
 		/* Don't look for a match if there are no tags with
 		   this number of bits in the hash table. */
@@ -705,7 +557,7 @@ static inline void hash_search(rzip_control *control, struct rzip_state *st,
 			st->last_match = current.p + current.len;
 			current.p = p = st->last_match;
 			current.len = 0;
-			t = control->full_tag(control, st, p);
+			t = single_full_tag(control, st, p);
 		}
 
 		if (p > cksum_limit) {
@@ -718,7 +570,7 @@ static inline void hash_search(rzip_control *control, struct rzip_state *st,
 			control->checksum.buf = malloc(control->checksum.len);
 			if (unlikely(!control->checksum.buf))
 				failure("Failed to malloc ckbuf in hash_search\n");
-			control->do_mcpy(control, control->checksum.buf, cksum_limit, control->checksum.len);
+			single_mcpy(control, control->checksum.buf, cksum_limit, control->checksum.len);
 			control->checksum.cksum = &st->cksum;
 			cksum_update(control);
 			cksum_limit += control->checksum.len;
@@ -756,14 +608,14 @@ static inline void hash_search(rzip_control *control, struct rzip_state *st,
 		cksum_remains = control->checksum.len % cksum_len;
 
 		for (i = 0; i < cksum_chunks; i++) {
-			control->do_mcpy(control, control->checksum.buf, cksum_limit, cksum_len);
+			single_mcpy(control, control->checksum.buf, cksum_limit, cksum_len);
 			cksum_limit += cksum_len;
 			st->cksum = CrcUpdate(st->cksum, control->checksum.buf, cksum_len);
 			if (!NO_MD5)
 				md5_process_bytes(control->checksum.buf, cksum_len, &control->ctx);
 		}
 		/* Process end of the checksum buffer */
-		control->do_mcpy(control, control->checksum.buf, cksum_limit, cksum_remains);
+		single_mcpy(control, control->checksum.buf, cksum_limit, cksum_remains);
 		st->cksum = CrcUpdate(st->cksum, control->checksum.buf, cksum_remains);
 		if (!NO_MD5)
 			md5_process_bytes(control->checksum.buf, cksum_remains, &control->ctx);
@@ -1028,10 +880,6 @@ void rzip_fd(rzip_control *control, int fd_in, int fd_out)
 	gettimeofday(&start, NULL);
 
 	prepare_streamout_threads(control);
-	control->do_mcpy = single_mcpy;
-	control->next_tag = &single_next_tag;
-	control->full_tag = &single_full_tag;
-	control->match_len = &single_match_len;
 
 	while (!pass || len > 0 || (STDIN && !st->stdin_eof)) {
 		double pct_base, pct_multiple;
@@ -1093,13 +941,6 @@ retry:
 				}
 				goto retry;
 			}
-// 			if (st->mmap_size < st->chunk_size) {
-// 				print_maxverbose("Enabling sliding mmap mode and using mmap of %lld bytes with window of %lld bytes\n", st->mmap_size, st->chunk_size);
-// 				control->do_mcpy = &sliding_mcpy;
-// 				control->next_tag = &sliding_next_tag;
-// 				control->full_tag = &sliding_full_tag;
-// 				control->match_len = &sliding_match_len;
-// 			}
 		}
 		print_maxverbose("Succeeded in testing %lld sized mmap for rzip pre-processing\n", st->mmap_size);
 
