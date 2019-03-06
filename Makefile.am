@@ -23,7 +23,7 @@ m4/ltversion.m4
 
 SUBDIRS = lzma man doc
 
-AM_CFLAGS = -I. -I lzma/C -DNDEBUG
+AM_CFLAGS = -I. -I lzma/C -DNDEBUG -lumap
 AM_CXXFLAGS = $(AM_CFLAGS)
 
 lrztardir = $(bindir)
