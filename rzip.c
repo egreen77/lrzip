@@ -709,16 +709,6 @@ init_sliding_mmap(rzip_control *control, struct rzip_state *st, int fd_in,
 		  i64 offset)
 {
 	struct sliding_buffer *sb = &control->sb;
-
-	/* Initialise the high buffer. One page size is fastest to manipulate */
-	if (!STDIN) {
-		sb->high_length = control->page_size;
-		sb->buf_high = (uchar *)mmap(NULL, sb->high_length, PROT_READ, MAP_SHARED, fd_in, offset);
-		if (unlikely(sb->buf_high == MAP_FAILED))
-			failure("Unable to mmap buf_high in init_sliding_mmap\n");
-		sb->size_high = sb->high_length;
-		sb->offset_high = 0;
-	}
 	sb->offset_low = 0;
 	sb->offset_search = 0;
 	sb->size_low = st->mmap_size;
@@ -748,10 +738,6 @@ rzip_chunk(rzip_control *control, struct rzip_state *st, int fd_in, int fd_out,
 	if (!STDIN) {
 		print_verbose("uunmap buf_low\n");
 		if (unlikely(uunmap(sb->buf_low, sb->size_low))) {
-			close_stream_out(control, st->ss);
-			failure("Failed to munmap in rzip_chunk\n");
-		}
-		if (unlikely(munmap(sb->buf_high, sb->size_high))) {
 			close_stream_out(control, st->ss);
 			failure("Failed to munmap in rzip_chunk\n");
 		}
@@ -860,7 +846,7 @@ void rzip_fd(rzip_control *control, int fd_in, int fd_out)
 	if (st->chunk_size < len)
 		round_to_page(&st->chunk_size);
 	
-	int umap_pgsz = umap_cfg_get_pagesize();
+	uint64_t umap_pgsz = (uint64_t) umap_cfg_get_pagesize();
 	umap_cfg_set_bufsize((control->ramsize / 8) / umap_pgsz);
 	print_verbose("Umap page size: %d bytes\n", umap_pgsz);
 	print_verbose("Setting umap buffer size to: %llu pages\n", umap_cfg_get_bufsize());
@@ -898,6 +884,7 @@ void rzip_fd(rzip_control *control, int fd_in, int fd_out)
 
 retry:
 		if (STDIN) {
+			print_maxverbose("Reading input from stdin.\n", st->mmap_size);
 			/* NOTE the buf is saved here for STDIN mode */
 			sb->buf_low = mmap(NULL, st->mmap_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
 			/* Better to shrink the window to the largest size that works than fail */
@@ -921,10 +908,11 @@ retry:
 			st->chunk_size = st->mmap_size;
 			mmap_stdin(control, sb->buf_low, st);
 		} else {
+			print_maxverbose("Reading file-backed input.\n", st->mmap_size);
 			/* NOTE The buf is saved here for !STDIN mode */
-			st->mmap_size = control->max_chunk;
+			st->mmap_size = ((control->max_chunk / umap_pgsz) + 1) * umap_pgsz;
 			sb->buf_low = (uchar *)umap(sb->buf_low, st->mmap_size, PROT_READ, MAP_PRIVATE, fd_in, offset);
-			if (sb->buf_low == MAP_FAILED) {
+			if (sb->buf_low == MAP_FAILED || !sb) {
 				if (unlikely(errno != ENOMEM)) {
 					close_streamout_threads(control);
 					dealloc(st->hash_table);
@@ -942,7 +930,7 @@ retry:
 				goto retry;
 			}
 		}
-		print_maxverbose("Succeeded in testing %lld sized mmap for rzip pre-processing\n", st->mmap_size);
+		print_maxverbose("Succeeded in testing %lld sized umap for rzip pre-processing\n", st->mmap_size);
 
 		if (st->chunk_size > control->ramsize)
 			print_verbose("Compression window is larger than ram, will proceed with unlimited mode possibly much slower\n");
