@@ -59,7 +59,7 @@
 /* needed for CRC routines */
 #include "lzma/C/7zCrc.h"
 
-#include "umap.h"
+#include "umap/umap.h"
 
 #ifndef MAP_ANONYMOUS
 # define MAP_ANONYMOUS MAP_ANON
@@ -846,10 +846,10 @@ void rzip_fd(rzip_control *control, int fd_in, int fd_out)
 	if (st->chunk_size < len)
 		round_to_page(&st->chunk_size);
 	
-	uint64_t umap_pgsz = (uint64_t) umap_cfg_get_pagesize();
-	umap_cfg_set_bufsize((control->ramsize / 8) / umap_pgsz);
+	uint64_t umap_pgsz = (uint64_t) umapcfg_get_umap_page_size();
+//	umap_cfg_set_bufsize((control->ramsize / 8) / umap_pgsz);
 	print_verbose("Umap page size: %d bytes\n", umap_pgsz);
-	print_verbose("Setting umap buffer size to: %llu pages\n", umap_cfg_get_bufsize());
+//	print_verbose("Setting umap buffer size to: %llu pages\n", umap_cfg_get_bufsize());
 	print_verbose("Max chunk size: %llu bytes\n", control->max_chunk);
 
 	st->level = &levels[control->compression_level];
